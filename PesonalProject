@@ -1,0 +1,312 @@
+// - 우상단 타이머: 시작부터 60초 카운트다운(인트로 3초 포함)
+// - 인트로 3초: Get Ready + 3,2,1 
+// - 인트로 끝나면 BGM 1회 재생 시작(반복X), 게임 플레이 시작
+// - 평소 타겟 1개, 마지막 5초(remain<=5)에는 타겟 증가
+// - 타겟은 target.png 에서 중앙 정사각형(얼굴로 가정) 잘라 30x30으로 사용
+// - 타겟 리스폰될 때마다 랜덤 색상 틴트
+// - 점수 획득마다 효과음(score.wav) (프레임 멈춤 없음)
+// - 마지막 5초 화면 반전 + 경고 문구
+// 준비물(실행 파일 폴더):
+//   bgm.wav, score.wav, target.png
+
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <ctime>
+#include <string>
+#include <chrono>
+#include <vector>
+#include <algorithm>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
+#endif
+
+// ======================= 설정 =======================
+static constexpr int TOTAL_SEC = 60;
+static constexpr int INTRO_SEC = 3;
+static constexpr int MAX_TARGETS = 3;          
+static constexpr int SPRITE_POOL_SIZE = 32; 
+static constexpr double MOVE_RATIO = 0;     
+static constexpr bool HALF_CHECK_IN_LAST5 = true; 
+// ===========================================================
+
+struct Target {
+    cv::Point pos;    
+    int w = 30, h = 30;
+    cv::Mat sprite;  
+
+static cv::Point randomPos(int W, int H, int tw, int th) {
+    if (W <= tw || H <= th) return { 0, 0 };
+    return cv::Point(rand() % (W - tw), rand() % (H - th));
+}
+
+static cv::Mat makeFaceTarget30(const std::string& path) {
+    cv::Mat img = cv::imread(path, cv::IMREAD_COLOR);
+    if (img.empty()) return cv::Mat();
+
+    int faceSize = (int)(std::min(img.cols, img.rows) * 0.55);
+    int x = (img.cols - faceSize) / 2;
+    int y = (img.rows - faceSize) / 2;
+
+    cv::Rect faceRect(x, y, faceSize, faceSize);
+    faceRect &= cv::Rect(0, 0, img.cols, img.rows);
+
+    cv::Mat face = img(faceRect).clone();
+    cv::Mat face30;
+    cv::resize(face, face30, cv::Size(30, 30), 0, 0, cv::INTER_AREA);
+    return face30;
+}
+
+static cv::Scalar randomColorBgr() {
+    return cv::Scalar(rand() % 256, rand() % 256, rand() % 256);
+}
+
+static cv::Mat makeTintedSprite(const cv::Mat& srcBgr30, cv::Scalar colorBgr) {
+    cv::Mat colorMat(srcBgr30.size(), srcBgr30.type(), colorBgr);
+    cv::Mat tinted;
+    cv::addWeighted(srcBgr30, 0.45, colorMat, 0.55, 0.0, tinted);
+    return tinted;
+}
+
+#ifdef _WIN32
+static bool mciChecked(const std::wstring& cmd) {
+    MCIERROR err = mciSendStringW(cmd.c_str(), NULL, 0, NULL);
+    if (err != 0) {
+        wchar_t buf[256]{};
+        if (mciGetErrorStringW(err, buf, 256)) {
+            std::wcerr << L"[MCI ERROR] (" << err << L") cmd: " << cmd << L"\n  msg: " << buf << L"\n";
+        }
+        else {
+            std::wcerr << L"[MCI ERROR] (" << err << L") cmd: " << cmd << L"\n  msg: <no error string>\n";
+        }
+        return false;
+    }
+    return true;
+}
+
+static void AudioInit() {
+    mciSendStringW(L"close bgm", NULL, 0, NULL);
+    mciSendStringW(L"close sfx", NULL, 0, NULL);
+
+    mciChecked(L"open \"bgm.wav\" type waveaudio alias bgm");
+    mciChecked(L"open \"score.wav\" type waveaudio alias sfx");
+}
+
+static void BgmPlayOnce() {
+    mciSendStringW(L"stop bgm", NULL, 0, NULL);
+    mciSendStringW(L"seek bgm to start", NULL, 0, NULL);
+    mciChecked(L"play bgm");
+}
+
+static void PlayScoreSfx_NoStall() {
+    mciSendStringW(L"stop sfx", NULL, 0, NULL);
+    mciSendStringW(L"seek sfx to start", NULL, 0, NULL);
+    mciSendStringW(L"play sfx", NULL, 0, NULL);
+}
+
+static void AudioCloseAll() {
+    mciSendStringW(L"stop sfx", NULL, 0, NULL);
+    mciSendStringW(L"stop bgm", NULL, 0, NULL);
+    mciSendStringW(L"close sfx", NULL, 0, NULL);
+    mciSendStringW(L"close bgm", NULL, 0, NULL);
+}
+#else
+static void AudioInit() {}
+static void BgmPlayOnce() {}
+static void PlayScoreSfx_NoStall() {}
+static void AudioCloseAll() {}
+#endif
+
+void runProject() CV_NOEXCEPT {
+    using SteadyClock = std::chrono::steady_clock;
+
+    srand((unsigned)time(0));
+
+    cv::VideoCapture cap(0);
+    if (!cap.isOpened()) {
+        std::cerr << "Error: 웹캠이 없습니다\n";
+        return;
+    }
+
+    int W = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
+    int H = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+
+    cv::Mat baseFace30 = makeFaceTarget30("target.png");
+    if (baseFace30.empty()) baseFace30 = makeFaceTarget30("target.jpg");
+    if (baseFace30.empty()) {
+        std::cerr << "Error: target.png / target.jpg 로드 실패 (실행 폴더 확인)\n";
+        cap.release();
+        return;
+    }
+
+    std::vector<cv::Mat> spritePool;
+    spritePool.reserve(SPRITE_POOL_SIZE);
+    for (int i = 0; i < SPRITE_POOL_SIZE; ++i) {
+        spritePool.push_back(makeTintedSprite(baseFace30, randomColorBgr()));
+    }
+    auto pickSprite = [&]() -> const cv::Mat& {
+        return spritePool[rand() % spritePool.size()];
+        };
+
+    AudioInit();
+
+    cv::Mat prevGray;
+    int score = 0;
+
+    auto startTime = SteadyClock::now(); 
+    bool gameplayStarted = false;
+    bool bgmStarted = false;
+
+    std::vector<Target> targets;
+    targets.reserve(MAX_TARGETS);
+
+    {
+        Target t;
+        t.pos = randomPos(W, H, t.w, t.h);
+        t.sprite = pickSprite();
+        targets.push_back(t);
+    }
+
+    cv::namedWindow("GAME");
+
+    int frameCount = 0;
+
+    while (true) {
+        frameCount++;
+
+        cv::Mat frame, gray;
+        cap >> frame;
+        if (frame.empty()) break;
+
+        cv::flip(frame, frame, 1);
+        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+        cv::GaussianBlur(gray, gray, cv::Size(15, 15), 0);
+
+        if (prevGray.empty()) gray.copyTo(prevGray);
+
+        int elapsedTotal = (int)std::chrono::duration_cast<std::chrono::seconds>(
+            SteadyClock::now() - startTime).count();
+        int remain = TOTAL_SEC - elapsedTotal;
+
+        if (remain <= 0) {
+            cv::Mat endFrame = frame.clone();
+            cv::putText(endFrame, "TIME OVER!", cv::Point(40, 90),
+                cv::FONT_HERSHEY_SIMPLEX, 1.6, cv::Scalar(255, 255, 255), 3);
+            cv::putText(endFrame, "Final Score: " + std::to_string(score),
+                cv::Point(40, 150),
+                cv::FONT_HERSHEY_SIMPLEX, 1.2, cv::Scalar(255, 255, 255), 3);
+            cv::imshow("GAME", endFrame);
+            cv::waitKey(900);
+            break;
+        }
+
+        if (!gameplayStarted) {
+            int introRemain = INTRO_SEC - elapsedTotal;
+
+            cv::Mat introFrame = frame.clone();
+            cv::putText(introFrame, "Get Ready!", cv::Point(40, 80),
+                cv::FONT_HERSHEY_SIMPLEX, 1.5, cv::Scalar(255, 255, 255), 3);
+            cv::putText(introFrame, std::to_string(std::max(0, introRemain)),
+                cv::Point(W / 2 - 25, H / 2),
+                cv::FONT_HERSHEY_SIMPLEX, 3.0, cv::Scalar(255, 255, 255), 5);
+
+            std::string timeText = "Time: " + std::to_string(remain) + "s";
+            int base = 0;
+            cv::Size ts = cv::getTextSize(timeText, cv::FONT_HERSHEY_SIMPLEX, 1.1, 3, &base);
+            cv::putText(introFrame, timeText, cv::Point(W - ts.width - 20, 40),
+                cv::FONT_HERSHEY_SIMPLEX, 1.1, cv::Scalar(255, 255, 255), 3);
+
+            cv::imshow("GAME", introFrame);
+
+            if (elapsedTotal >= INTRO_SEC) {
+                gameplayStarted = true;
+                if (!bgmStarted) {
+                    bgmStarted = true;
+                    BgmPlayOnce();
+                }
+            }
+
+            if (cv::waitKey(10) == 27) break;
+            continue;
+        }
+
+        int desired = (remain <= 5) ? MAX_TARGETS : 1;
+
+        while ((int)targets.size() < desired) {
+            Target nt;
+            nt.pos = randomPos(W, H, nt.w, nt.h);
+            nt.sprite = pickSprite();
+            targets.push_back(nt);
+        }
+        while ((int)targets.size() > desired) {
+            targets.pop_back();
+        }
+
+        cv::Mat diff, bin;
+        cv::absdiff(prevGray, gray, diff);
+        cv::threshold(diff, bin, 25, 255, cv::THRESH_BINARY);
+
+        bool doCheck = true;
+        if (HALF_CHECK_IN_LAST5 && remain <= 5) {
+            doCheck = (frameCount % 2 == 0);
+        }
+
+        if (doCheck) {
+            for (auto& tg : targets) {
+                cv::Rect r(tg.pos.x, tg.pos.y, tg.w, tg.h);
+                r &= cv::Rect(0, 0, W, H);
+                if (r.area() <= 0) continue;
+
+                int moved = cv::countNonZero(bin(r));
+                if (moved > (int)(r.area() * MOVE_RATIO)) {
+                    score++;
+                    PlayScoreSfx_NoStall();
+
+                    tg.pos = randomPos(W, H, tg.w, tg.h);
+                    tg.sprite = pickSprite();
+                }
+            }
+        }
+
+        cv::Mat out = frame.clone();
+
+        for (const auto& tg : targets) {
+            cv::Rect dst(tg.pos.x, tg.pos.y, tg.w, tg.h);
+            dst &= cv::Rect(0, 0, W, H);
+            if (dst.area() <= 0) continue;
+
+            tg.sprite.copyTo(out(dst));
+        }
+
+        if (remain <= 5) {
+            cv::bitwise_not(out, out);
+            cv::putText(out, "HURRY UP! " + std::to_string(remain) + "s left",
+                cv::Point(30, H - 30),
+                cv::FONT_HERSHEY_SIMPLEX, 1.1, cv::Scalar(255, 255, 255), 3);
+        }
+
+        cv::putText(out, "Score: " + std::to_string(score), cv::Point(20, 40),
+            cv::FONT_HERSHEY_SIMPLEX, 1.1, cv::Scalar(255, 255, 255), 3);
+
+        {
+            std::string timeText = "Time: " + std::to_string(remain) + "s";
+            int base = 0;
+            cv::Size ts = cv::getTextSize(timeText, cv::FONT_HERSHEY_SIMPLEX, 1.1, 3, &base);
+            cv::putText(out, timeText, cv::Point(W - ts.width - 20, 40),
+                cv::FONT_HERSHEY_SIMPLEX, 1.1, cv::Scalar(255, 255, 255), 3);
+        }
+
+        cv::imshow("GAME", out);
+
+        gray.copyTo(prevGray);
+
+        if (cv::waitKey(10) == 27) break;
+    }
+
+    AudioCloseAll();
+    cap.release();
+    cv::destroyAllWindows();
+}
