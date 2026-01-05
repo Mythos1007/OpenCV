@@ -219,6 +219,18 @@ void runProject() CV_NOEXCEPT {
             cv::putText(introFrame, timeText, cv::Point(W - ts.width - 20, 40),
                 cv::FONT_HERSHEY_SIMPLEX, 1.1, cv::Scalar(255, 255, 255), 3);
 
+            if ((frameCount / 15) % 2 == 0) {
+                cv::putText(
+                    introFrame,
+                    "TOUCH THE IMAGE !!",
+                    cv::Point(40, H - 80),
+                    cv::FONT_HERSHEY_SIMPLEX,
+                    1.2,
+                    cv::Scalar(255, 255, 255),
+                    3
+                );
+            }
+
             cv::imshow("GAME", introFrame);
 
             if (elapsedTotal >= INTRO_SEC) {
